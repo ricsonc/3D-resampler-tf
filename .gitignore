@@ -1,0 +1,9 @@
+*~
+#*
+build/CMakeFiles*
+build/#*
+build/__*
+*cmake
+*so
+*sh
+zero_out*
