@@ -7,6 +7,9 @@
 #include "tensorflow/core/framework/shape_inference.h"
 #include "tensorflow/core/framework/op_kernel.h"
 
+#define DEBUG 0
+#define LOCALACCUM 0 
+
 using namespace tensorflow;
 typedef TTypes<float>::ConstFlat FlatT;
 
@@ -31,6 +34,102 @@ int4 sliceShapeToint4(const TensorShape &x) {
             (int) x.dim_size(4)};
 }
 
+__device__ int compute_num_threads() {
+    return blockDim.x * blockDim.y * blockDim.z;
+}
+
+__device__ int get_thread_index() {
+    return threadIdx.x * blockDim.y * blockDim.z + threadIdx.y * blockDim.z + threadIdx.z;
+}
+
+//// a useful little hashmap ////
+
+template <class T>
+struct hashmap
+{
+    int * keys;
+    T * values;
+    int size;
+    int max_tries;
+    int* load;
+};
+
+template <class T>
+__device__ void clear_hashmap(hashmap<T> hashmap)
+{
+    // keys are initialized to -1, values to 0
+    
+    int index = get_thread_index();
+    int num_threads = compute_num_threads();
+
+    for (int i = index; i < hashmap.size; i += num_threads) {
+        hashmap.keys[i] = -1;
+    }
+    
+    for (int i = index; i < hashmap.size; i += num_threads) {
+        hashmap.values[i] = 0;
+    }
+
+    if (DEBUG && index == 0){
+        *(hashmap.load) = 0;
+    }
+}
+
+template <class T>
+__device__ void hashmap_accum(int key, T value, hashmap<T>& hashmap)
+{
+    int location = qprobe(key, hashmap);
+    atomicAdd(hashmap.values + location, value);
+}
+
+template <class T>
+__device__ void dump_hashmap(T * dest, hashmap<T>& hashmap)
+{
+    int index = get_thread_index();
+    int num_threads = compute_num_threads();
+   
+    for (int i = index; i < hashmap.size; i += num_threads) {
+        int key = hashmap.keys[i];
+        if (key == -1) {
+            continue;
+        }
+        atomicAdd(dest + key, hashmap.values[i]);
+    }
+}
+
+template <class T>
+__device__ int qprobe(int key, hashmap<T>& hashmap)
+{
+    int i = 0;
+    while (i < hashmap.max_tries) {
+        int location = (key + i * (i+1) / 2) % hashmap.size;
+        int current_key = hashmap.keys[location];
+
+        //we probe until we find the key, or until we find a blank spot
+        if (current_key == key) {
+            return location;
+        } else if (current_key == -1) {
+            int old = atomicCAS(hashmap.keys + location, -1, key);
+            if (old == -1 || old == key) {
+                if (DEBUG) {
+                    atomicAdd(hashmap.load, 1);
+                }
+                return location;
+            }
+            //else, someone beat us to the race, probe next value
+        }
+        i++;
+    }
+    printf("ERROR: quadratic probing failed for key %d at load %d/%d!\n",
+           key, *(hashmap.load), hashmap.size);
+    // if(*(hashmap.load) == 0) {
+    //     printf("load 0, key = %d, current key = %d\n", key, key % hashmap.size);
+    // }
+    
+    return 0;
+}
+
+/////
 
 __device__ int linear_index_3D(const int b, const int d, const int h, const int w,
                                const int c, const int4 &s) {
@@ -306,9 +405,140 @@ __device__ void computeGrad3D(
     atomicAdd(grad_source + i100, w100 * grad_out);
     atomicAdd(grad_source + i101, w101 * grad_out);
     atomicAdd(grad_source + i110, w110 * grad_out);
-    atomicAdd(grad_source + i111, w111 * grad_out);
+    atomicAdd(grad_source + i111, w111 * grad_out);  
 }
+
+__device__ void computeGrad3D_v2(
+    const float grad_out,
+    const float* source,
+    hashmap<float>& grad_source_accum,
+    float* grad_grid,
+    float3 & tmp_grid,
+    const int4 s, const int4 g, 
+    const int b,
+    const int c,
+    const float z, const float y, const float x,
+    const bool soft)
+{
+    //printf("%f %f %f %d %d\n", z, y, x, b, c);
+    int zl = static_cast<int>(floor(z));
+    int yl = static_cast<int>(floor(y));
+    int xl = static_cast<int>(floor(x));
+    int zu = zl+1;
+    int yu = yl+1;
+    int xu = xl+1;
+
+    int D = s.x; //pay attention!
+    int H = s.y; 
+    int W = s.z;
+
+    float dz = z - floor(z);
+    float dx = x - floor(x);
+    float dy = y - floor(y);
+
+    // begin boundary mode //
     
+    bool zlb = 0 <= zl && zl <= D-1;
+    bool zub = 0 <= zu && zu <= D-1;
+    bool ylb = 0 <= yl && yl <= H-1;
+    bool yub = 0 <= yu && yu <= H-1;
+    bool xlb = 0 <= xl && xl <= W-1;
+    bool xub = 0 <= xu && xu <= W-1;
+    
+    float b000 = static_cast<float>(zub && yub && xub);
+    float b001 = static_cast<float>(zub && yub && xlb);
+    float b010 = static_cast<float>(zub && ylb && xub);
+    float b011 = static_cast<float>(zub && ylb && xlb);
+    float b100 = static_cast<float>(zlb && yub && xub);
+    float b101 = static_cast<float>(zlb && yub && xlb);
+    float b110 = static_cast<float>(zlb && ylb && xub);
+    float b111 = static_cast<float>(zlb && ylb && xlb);
+
+    // end boundary mode //
+
+    zl = zl < 0 ? 0 : (zl >= D ? D-1 : zl);
+    zu = zu < 0 ? 0 : (zu >= D ? D-1 : zu);
+    yl = yl < 0 ? 0 : (yl >= H ? H-1 : yl);
+    yu = yu < 0 ? 0 : (yu >= H ? H-1 : yu);
+    xl = xl < 0 ? 0 : (xl >= W ? W-1 : xl);
+    xu = xu < 0 ? 0 : (xu >= W ? W-1 : xu);
+
+    int i000 = linear_index_3D(b, zl, yl, xl, c, s);
+    int i001 = linear_index_3D(b, zl, yl, xu, c, s);
+    int i010 = linear_index_3D(b, zl, yu, xl, c, s);
+    int i011 = linear_index_3D(b, zl, yu, xu, c, s);
+    int i100 = linear_index_3D(b, zu, yl, xl, c, s);
+    int i101 = linear_index_3D(b, zu, yl, xu, c, s);
+    int i110 = linear_index_3D(b, zu, yu, xl, c, s);
+    int i111 = linear_index_3D(b, zu, yu, xu, c, s);
+
+    float v000 = source[i000];
+    float v001 = source[i001];
+    float v010 = source[i010];
+    float v011 = source[i011];
+    float v100 = source[i100];
+    float v101 = source[i101];
+    float v110 = source[i110];
+    float v111 = source[i111];
+
+    float w000 = (1-dz)*(1-dy)*(1-dx);
+    float w001 = (1-dz)*(1-dy)*dx;
+    float w010 = (1-dz)*dy*(1-dx);
+    float w011 = (1-dz)*dy*dx;
+    float w100 = dz*(1-dy)*(1-dx);
+    float w101 = dz*(1-dy)*dx;
+    float w110 = dz*dy*(1-dx);
+    float w111 = dz*dy*dx;
+
+    if (!soft) {
+        w000 *= b000;
+        w001 *= b001;
+        w010 *= b010;
+        w011 *= b011;
+        w100 *= b100;
+        w101 *= b101;
+        w110 *= b110;
+        w111 *= b111;
+
+        //this is a dirty hack to get the correct gradients wrt grid
+        v000 *= b000;
+        v001 *= b001;
+        v010 *= b010;
+        v011 *= b011;
+        v100 *= b100;
+        v101 *= b101;
+        v110 *= b110;
+        v111 *= b111;
+    }
+
+    //gradients wrt grid
+    tmp_grid.x += grad_out * \
+        (+ (v100 - v000) * (1-dy)*(1-dx)
+         + (v101 - v001) * (1-dy)*dx
+         + (v110 - v010) * dy*(1-dx)
+         + (v111 - v011) * dy*dx);
+    tmp_grid.y += grad_out * \
+        (+ (v010 - v000) * (1-dz)*(1-dx)
+         + (v011 - v001) * (1-dz)*dx
+         + (v110 - v100) * dz*(1-dx)
+         + (v111 - v101) * dz*dx);
+    tmp_grid.z += grad_out * \
+        (+ (v001 - v000) * (1-dz)*(1-dy)
+         + (v011 - v010) * (1-dz)*dy
+         + (v101 - v100) * dz*(1-dy)
+         + (v111 - v110) * dz*dy);
+
+    //gradients wrt 8 source elements
+    hashmap_accum(i000, w000 * grad_out, grad_source_accum);
+    hashmap_accum(i001, w001 * grad_out, grad_source_accum);
+    hashmap_accum(i010, w010 * grad_out, grad_source_accum);
+    hashmap_accum(i011, w011 * grad_out, grad_source_accum);
+    hashmap_accum(i100, w100 * grad_out, grad_source_accum);
+    hashmap_accum(i101, w101 * grad_out, grad_source_accum);
+    hashmap_accum(i110, w110 * grad_out, grad_source_accum);
+    hashmap_accum(i111, w111 * grad_out, grad_source_accum);
+}
+
 __global__ void InterpolateKernel3DGrad(
     const float* grad,
     const float* source,
@@ -320,6 +550,17 @@ __global__ void InterpolateKernel3DGrad(
     const int B,
     const bool soft)
 {
+    hashmap<float> grad_source_accum;
+    if (LOCALACCUM) {
+        const int size = 2003;
+        __shared__ int keys[size];
+        __shared__ float values[size];
+        __shared__ int load[1];
+        grad_source_accum = {keys, values, size, 1000, load};
+    }
+    
+    //////////////
+    
     int tmp = blockIdx.x * blockDim.x + threadIdx.x;
     int b = tmp / s.x;
     int i = tmp % s.x; // z x y
@@ -335,17 +576,29 @@ __global__ void InterpolateKernel3DGrad(
     }
 
     float3 tmp_grid = {0,0,0};
-    
+
     for(int c = 0; c < s.w; c++) {
+    
         float grad_out = grad[linear_index_3D(b, i, j, k, c, s)];
-        computeGrad3D(grad_out, source, grad_source, grad_grid, tmp_grid,
-                      s, g, b, c, z, y, x, soft);
+
+        if (LOCALACCUM) {
+            __syncthreads();
+            clear_hashmap<float>(grad_source_accum);
+            __syncthreads();
+            computeGrad3D_v2(grad_out, source, grad_source_accum, grad_grid, tmp_grid,
+                             s, g, b, c, z, y, x, soft);
+            __syncthreads();
+            dump_hashmap<float>(grad_source, grad_source_accum);
+            __syncthreads();
+        } else {
+            computeGrad3D(grad_out, source, grad_source, grad_grid, tmp_grid,
+                          s, g, b, c, z, y, x, soft);
+        }
     }
 
     grad_grid[linear_index_3D(b, i, j, k, 0, g)] = tmp_grid.x;
     grad_grid[linear_index_3D(b, i, j, k, 1, g)] = tmp_grid.y;
     grad_grid[linear_index_3D(b, i, j, k, 2, g)] = tmp_grid.z;
-
 }
 
 void GridInterpolate3DGradKernelLauncher(
@@ -359,7 +612,14 @@ void GridInterpolate3DGradKernelLauncher(
     const bool soft)
 {
     int B = s.dim_size(0);
-    int TD = 1;
+
+    int TD;
+    if (LOCALACCUM) {
+        TD = 8;
+    } else {
+        TD = 1;
+    }
+    
     dim3 threads(TD, TD, TD);
     dim3 blocks(
         updiv(B*s.dim_size(1), TD),
